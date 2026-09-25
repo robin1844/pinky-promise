@@ -8,6 +8,8 @@ The game screen is published from [`docs/index.html`](docs/index.html) on GitHub
 
 One team creates a room and chooses a secret emoji. The other enters the three-digit room number and matches the emoji. Both phones then submit private choices, reveal the result together, and track coins through ten rounds. Either team can start another game in the same room after the ending.
 
+After a full ten-round game, the debrief compares the teams' combined coins with other completed games from the preceding 24 hours. The comparison is omitted when there are no other games. Each replay is recorded once in `completed_games`; games ended early by rage quit are excluded so the scores are comparable.
+
 ## Local API development
 
 Requires Node.js 22 or later.
@@ -16,6 +18,7 @@ Requires Node.js 22 or later.
 npm ci
 npm run build
 node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_flaky_whirlwind.sql
+node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_completed_games.sql
 npm start
 ```
 

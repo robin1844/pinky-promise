@@ -4,6 +4,7 @@ type Move = "cooperate" | "defect";
 type Round = { round: number; moves: [Move, Move]; coins: [number, number]; totals: [number, number] };
 type Room = {
   code: string;
+  gameId?: string;
   tokens: [string, string | null];
   emojis: string[];
   emojiSelected: string | null;
@@ -41,11 +42,28 @@ const getRoom = async (code: string) => {
   const row = await db().prepare("SELECT code, state, revision FROM rooms WHERE code = ?").bind(code).first<Row>();
   return row ? { room: JSON.parse(row.state) as Room, revision: row.revision } : null;
 };
-const view = (room: Room, revision: number, side: number) => ({
+const gameIdOf = (room: Room) => room.gameId ?? room.code;
+const isFinished = (room: Room) => room.history.length === room.maxRounds && room.quitBy === undefined;
+const archiveCompleted = async (room: Room) => {
+  if (!isFinished(room)) return;
+  await db().prepare("INSERT OR IGNORE INTO completed_games (game_id, combined_coins, finished_at) VALUES (?, ?, ?)")
+    .bind(gameIdOf(room), room.totals[0] + room.totals[1], Date.now()).run();
+};
+const dailyComparison = async (room: Room) => {
+  if (!isFinished(room)) return null;
+  const completed = await db().prepare("SELECT finished_at AS finishedAt FROM completed_games WHERE game_id = ?")
+    .bind(gameIdOf(room)).first<{ finishedAt: number }>();
+  if (!completed) return null;
+  const row = await db().prepare("SELECT COUNT(*) AS count, AVG(combined_coins) AS average FROM completed_games WHERE finished_at >= ? AND finished_at <= ? AND game_id <> ?")
+    .bind(completed.finishedAt - 24 * 60 * 60 * 1000, completed.finishedAt, gameIdOf(room)).first<{ count: number; average: number | null }>();
+  return row?.count && row.average !== null ? { count: row.count, average: Math.round(row.average) } : null;
+};
+const view = async (room: Room, revision: number, side: number) => ({
   code: room.code, revision, side, round: room.round, maxRounds: room.maxRounds,
   emojis: room.emojis, emojiSelected: side === 0 ? room.emojiSelected : undefined,
   joined: !!room.tokens[1], submitted: !!room.moves[side], opponentSubmitted: !!room.moves[1 - side],
   totals: room.totals, history: room.history, quitBy: room.quitBy ?? null,
+  daily: await dailyComparison(room),
   phase: room.quitBy !== undefined ? "quit" : room.history.length === room.maxRounds ? "finished" : room.revealed ? "revealed" : "choosing",
 });
 
@@ -77,7 +95,8 @@ export async function GET(request: Request, context: Context) {
     if (action !== "state") return failure("Not found", 404);
     const input = Object.fromEntries(new URL(request.url).searchParams);
     const current = await authenticated(input);
-    return current ? result(view(current.room, current.revision, current.side)) : failure("Room access expired", 401);
+    if (current) await archiveCompleted(current.room);
+    return current ? result(await view(current.room, current.revision, current.side)) : failure("Room access expired", 401);
   } catch { return failure("Room service unavailable", 503); }
 }
 
@@ -87,9 +106,10 @@ export async function POST(request: Request, context: Context) {
     const input = await request.json() as Input;
     if (action === "create") {
       await db().prepare("DELETE FROM rooms WHERE created_at < ?").bind(Date.now() - 4 * 60 * 60 * 1000).run();
+      await db().prepare("DELETE FROM completed_games WHERE finished_at < ?").bind(Date.now() - 30 * 24 * 60 * 60 * 1000).run();
       for (let attempt = 0; attempt < 50; attempt++) {
         const code = randomCode();
-        const room: Room = { code, tokens: [token(), null], emojis: emojis(), emojiSelected: null, moves: [null,null], totals: [0,0], history: [], round: 1, maxRounds: 10, revealed: false };
+        const room: Room = { code, gameId: crypto.randomUUID(), tokens: [token(), null], emojis: emojis(), emojiSelected: null, moves: [null,null], totals: [0,0], history: [], round: 1, maxRounds: 10, revealed: false };
         const saved = await db().prepare("INSERT OR IGNORE INTO rooms (code, state, revision, created_at) VALUES (?, ?, 0, ?)").bind(code, JSON.stringify(room), Date.now()).run();
         if (saved.meta.changes) return result({ code, token: room.tokens[0], side: 0 });
       }
@@ -114,6 +134,7 @@ export async function POST(request: Request, context: Context) {
     }
     const auth = await authenticated(input);
     if (!auth) return failure("Room access expired", 401);
+    if (action === "restart") await archiveCompleted(auth.room);
     const changed = await mutate(code, room => {
       const side = room.tokens.indexOf(String(input.token));
       if (side < 0) return { error: "Room access expired", status: 401 };
@@ -144,17 +165,18 @@ export async function POST(request: Request, context: Context) {
       } else if (action === "restart") {
         const ended = room.quitBy !== undefined || room.history.length === room.maxRounds;
         if (!ended) return { error: "Finish this game before starting another", status: 409 };
-        room.round = 1; room.moves = [null,null]; room.totals = [0,0]; room.history = []; room.revealed = false; delete room.quitBy;
+        room.gameId = crypto.randomUUID(); room.round = 1; room.moves = [null,null]; room.totals = [0,0]; room.history = []; room.revealed = false; delete room.quitBy;
       } else return { error: "Not found", status: 404 };
       return {};
     });
     if (isFailure(changed)) {
       if (action === "restart" && changed.error === "Finish this game before starting another") {
         const current = await authenticated(input);
-        if (current && current.room.round === 1 && current.room.history.length === 0 && !current.room.moves[0] && !current.room.moves[1]) return result(view(current.room, current.revision, current.side));
+        if (current && current.room.round === 1 && current.room.history.length === 0 && !current.room.moves[0] && !current.room.moves[1]) return result(await view(current.room, current.revision, current.side));
       }
       return failure(changed.error, changed.status);
     }
-    return result(view(changed.room, changed.revision, auth.side));
+    await archiveCompleted(changed.room);
+    return result(await view(changed.room, changed.revision, auth.side));
   } catch { return failure("Room service unavailable", 503); }
 }
